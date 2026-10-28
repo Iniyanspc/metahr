@@ -1,0 +1,984 @@
+// metadatum People — data model. Design notes: docs/plan/PLAN.md
+//
+// Conventions
+// - Every table: id (cuid), createdAt, updatedAt, deletedAt (soft delete; a Prisma
+//   client extension filters deletedAt IS NULL by default).
+// - Money: Int paise. All salary figures are MONTHLY, so Int (max ~₹2.1 crore/month)
+//   is safe; annual CTC is derived in code.
+// - Leave quantities: Int "half-day units" (1 = 0.5 day) to avoid decimals.
+// - Calendar dates (DOB, attendance day, leave day): @db.Date, interpreted in Asia/Kolkata.
+//   Instants (check-in time, approvals): timestamptz.
+// - *Enc fields: AES-256-GCM ciphertext (base64, prefixed with key version), key from env.
+//   *Last4 fields hold the only plaintext used for masked display.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Auth (Auth.js adapter) ─────────────────────────────
+
+enum Role {
+  ADMIN
+  HR
+  EMPLOYEE // Manager and Intern capabilities are derived, see PLAN.md §3
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique // work email; must be pre-provisioned, no self sign-up
+  emailVerified DateTime? @db.Timestamptz
+  name          String?
+  image         String?
+  role          Role      @default(EMPLOYEE)
+  isActive      Boolean   @default(true)
+  lastLoginAt   DateTime? @db.Timestamptz
+  person        Person?
+  accounts      Account[]
+  sessions      Session[]
+  auditLogs     AuditLog[]
+  createdAt     DateTime  @default(now()) @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @db.Timestamptz
+  deletedAt     DateTime? @db.Timestamptz
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt         DateTime @default(now()) @db.Timestamptz
+  updatedAt         DateTime @updatedAt @db.Timestamptz
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime @db.Timestamptz
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt @db.Timestamptz
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime @db.Timestamptz
+
+  @@unique([identifier, token])
+}
+
+model RateLimitHit {
+  id        String   @id @default(cuid())
+  key       String // e.g. "magic-link:<email-hash>" or "ip:<hash>"
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  @@index([key, createdAt])
+}
+
+// ───────────────────────────────────── People ─────────────────────────────────────
+
+enum EmploymentType {
+  FULL_TIME
+  CONTRACT
+  INTERN
+}
+
+enum EmploymentStatus {
+  ONBOARDING
+  ACTIVE
+  NOTICE
+  EXITED
+}
+
+// A human. Profile data lives here and survives intern → full-time conversion.
+model Person {
+  id                    String    @id @default(cuid())
+  userId                String?   @unique
+  user                  User?     @relation(fields: [userId], references: [id])
+  firstName             String
+  lastName              String
+  preferredName         String?
+  workEmail             String    @unique
+  personalEmail         String?
+  phone                 String?
+  dateOfBirth           DateTime? @db.Date
+  addressLine1          String?
+  addressLine2          String?
+  city                  String?
+  state                 String?
+  postalCode            String?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  emergencyContactRel   String?
+  photoFileId           String?   @unique
+  photo                 StoredFile? @relation("PersonPhoto", fields: [photoFileId], references: [id])
+
+  employments        Employment[] @relation("EmploymentPerson")
+  directReports      Employment[] @relation("EmploymentManager")
+  mentees            InternDetails[] @relation("Mentor")
+  statutory          StatutoryDetails?
+  bankAccounts       BankAccount[]
+  checklists         Checklist[]
+  accessGrants       AccessGrant[]
+  assetAssignments   AssetAssignment[]
+  attendance         AttendanceRecord[]
+  regularisations    Regularisation[]
+  leaveRequests      LeaveRequest[]
+  leaveLedger        LeaveLedgerEntry[]
+  reimbursements     Reimbursement[]
+  adjustments        PayrollAdjustment[]
+  documents          PersonDocument[]
+  generatedDocuments GeneratedDocument[]
+
+  createdAt DateTime  @default(now()) @db.Timestamptz
+  updatedAt DateTime  @updatedAt @db.Timestamptz
+  deletedAt DateTime? @db.Timestamptz
+
+  @@index([lastName, firstName])
+}
+
+// One stint with the company. Conversion = close the intern Employment, open a
+// FULL_TIME one with a new employee code. Exactly one current (endedOn null) per person.
+model Employment {
+  id               String           @id @default(cuid())
+  personId         String
+  person           Person           @relation("EmploymentPerson", fields: [personId], references: [id])
+  employeeCode     String           @unique // MD-0001 / MD-INT-001
+  type             EmploymentType
+  status           EmploymentStatus @default(ONBOARDING)
+  departmentId     String?
+  department       Department?      @relation(fields: [departmentId], references: [id])
+  designationId    String?
+  designation      Designation?     @relation(fields: [designationId], references: [id])
+  managerId        String? // a Person
+  manager          Person?          @relation("EmploymentManager", fields: [managerId], references: [id])
+  joiningDate      DateTime         @db.Date
+  probationEndDate DateTime?        @db.Date
+  endedOn          DateTime?        @db.Date // null = current
+  endReason        String? // "Converted to full-time", "Resigned", ...
+  convertedFromId  String?          @unique
+  convertedFrom    Employment?      @relation("Conversion", fields: [convertedFromId], references: [id])
+  convertedTo      Employment?      @relation("Conversion")
+
+  internDetails    InternDetails?
+  separation       Separation?
+  salaryStructures SalaryStructure[]
+  payrollEntries   PayrollEntry[]
+
+  createdAt DateTime  @default(now()) @db.Timestamptz
+  updatedAt DateTime  @updatedAt @db.Timestamptz
+  deletedAt DateTime? @db.Timestamptz
+
+  @@index([personId, endedOn])
+  @@index([managerId])
+}
+
+model InternDetails {
+  id              String     @id @default(cuid())
+  employmentId    String     @unique
+  employment      Employment @relation(fields: [employmentId], references: [id])
+  college         String
+  programme       String
+  internshipStart DateTime   @db.Date
+  internshipEnd   DateTime   @db.Date
+  mentorId        String?
+  mentor          Person?    @relation("Mentor", fields: [mentorId], references: [id])
+  stipendPaise    Int // monthly; payroll reads the SalaryStructure, this is the offer figure
+  createdAt       DateTime   @default(now()) @db.Timestamptz
+  updatedAt       DateTime   @updatedAt @db.Timestamptz
+  deletedAt       DateTime?  @db.Timestamptz
+}
+
+// Encrypted at rest; Admin/HR only. Interns may leave UAN empty.
+model StatutoryDetails {
+  id           String    @id @default(cuid())
+  personId     String    @unique
+  person       Person    @relation(fields: [personId], references: [id])
+  panEnc       String?
+  panLast4     String?
+  panHash      String?   @unique // HMAC blind index for duplicate detection
+  aadhaarEnc   String?
+  aadhaarLast4 String?
+  uanEnc       String?
+  uanLast4     String?
+  esiNumberEnc String?
+  createdAt    DateTime  @default(now()) @db.Timestamptz
+  updatedAt    DateTime  @updatedAt @db.Timestamptz
+  deletedAt    DateTime? @db.Timestamptz
+}
+
+model BankAccount {
+  id               String    @id @default(cuid())
+  personId         String
+  person           Person    @relation(fields: [personId], references: [id])
+  accountHolder    String
+  accountNumberEnc String
+  accountLast4     String
+  ifscEnc          String
+  bankName         String?
+  isPrimary        Boolean   @default(true) // one primary per person (partial unique index in SQL migration)
+  createdAt        DateTime  @default(now()) @db.Timestamptz
+  updatedAt        DateTime  @updatedAt @db.Timestamptz
+  deletedAt        DateTime? @db.Timestamptz
+
+  @@index([personId])
+}
+
+model Department {
+  id          String       @id @default(cuid())
+  name        String       @unique
+  employments Employment[]
+  createdAt   DateTime     @default(now()) @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @db.Timestamptz
+  deletedAt   DateTime?    @db.Timestamptz
+}
+
+model Designation {
+  id          String       @id @default(cuid())
+  title       String       @unique
+  employments Employment[]
+  createdAt   DateTime     @default(now()) @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @db.Timestamptz
+  deletedAt   DateTime?    @db.Timestamptz
+}
+
+// Gap-free sequences for employee codes; incremented inside the creating transaction.
+model Counter {
+  key       String   @id // "MD", "MD-INT"
+  value     Int      @default(0)
+  updatedAt DateTime @updatedAt @db.Timestamptz
+}
+
+// ─────────────────────────── Onboarding / offboarding ───────────────────────────
+
+enum ChecklistKind {
+  ONBOARDING
+  OFFBOARDING
+  INTERN_END // convert-or-offboard decision, created 14 days before internshipEnd
+}
+
+enum TaskAssignee {
+  HR
+  MANAGER
+  IT
+  EMPLOYEE
+}
+
+model ChecklistTemplate {
+  id             String                  @id @default(cuid())
+  name           String
+  kind           ChecklistKind
+  employmentType EmploymentType?         // null = applies to all
+  tasks          ChecklistTemplateTask[]
+  checklists     Checklist[]
+  createdAt      DateTime                @default(now()) @db.Timestamptz
+  updatedAt      DateTime                @updatedAt @db.Timestamptz
+  deletedAt      DateTime?               @db.Timestamptz
+}
+
+model ChecklistTemplateTask {
+  id            String            @id @default(cuid())
+  templateId    String
+  template      ChecklistTemplate @relation(fields: [templateId], references: [id])
+  title         String
+  description   String?
+  assignee      TaskAssignee
+  dueOffsetDays Int // relative to joining date (onboarding) or last working day (offboarding)
+  sortOrder     Int
+  createdAt     DateTime          @default(now()) @db.Timestamptz
+  updatedAt     DateTime          @updatedAt @db.Timestamptz
+  deletedAt     DateTime?         @db.Timestamptz
+}
+
+model Checklist {
+  id          String             @id @default(cuid())
+  personId    String
+  person      Person             @relation(fields: [personId], references: [id])
+  templateId  String?
+  template    ChecklistTemplate? @relation(fields: [templateId], references: [id])
+  kind        ChecklistKind
+  completedAt DateTime?          @db.Timestamptz
+  tasks       ChecklistTask[]
+  createdAt   DateTime           @default(now()) @db.Timestamptz
+  updatedAt   DateTime           @updatedAt @db.Timestamptz
+  deletedAt   DateTime?          @db.Timestamptz
+
+  @@index([personId, kind])
+}
+
+model ChecklistTask {
+  id             String       @id @default(cuid())
+  checklistId    String
+  checklist      Checklist    @relation(fields: [checklistId], references: [id])
+  title          String
+  description    String?
+  assignee       TaskAssignee
+  assigneeUserId String? // resolved owner (the manager, the IT owner, ...)
+  dueDate        DateTime     @db.Date
+  completedAt    DateTime?    @db.Timestamptz
+  completedById  String?
+  notes          String?
+  sortOrder      Int
+  createdAt      DateTime     @default(now()) @db.Timestamptz
+  updatedAt      DateTime     @updatedAt @db.Timestamptz
+  deletedAt      DateTime?    @db.Timestamptz
+
+  @@index([assigneeUserId, completedAt])
+}
+
+enum FnfStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  SETTLED
+}
+
+model Separation {
+  id                     String     @id @default(cuid())
+  employmentId           String     @unique
+  employment             Employment @relation(fields: [employmentId], references: [id])
+  resignationDate        DateTime   @db.Date
+  noticePeriodDays       Int
+  lastWorkingDate        DateTime   @db.Date
+  reason                 String?
+  fnfStatus              FnfStatus  @default(NOT_STARTED)
+  fnfAmountPaise         Int?
+  fnfSettledOn           DateTime?  @db.Date
+  experienceLetterIssued Boolean    @default(false)
+  createdAt              DateTime   @default(now()) @db.Timestamptz
+  updatedAt              DateTime   @updatedAt @db.Timestamptz
+  deletedAt              DateTime?  @db.Timestamptz
+}
+
+// ───────────────────────── Accounts (access tracker) & assets ─────────────────────────
+// NO passwords, tokens or secrets anywhere. Free-text fields are checked by a
+// "looks like a secret" validator and the UI links to the company password manager.
+
+model SystemApp {
+  id          String        @id @default(cuid())
+  name        String        @unique // Google Workspace, Slack, GitHub, AWS, Jira
+  url         String?
+  grants      AccessGrant[]
+  createdAt   DateTime      @default(now()) @db.Timestamptz
+  updatedAt   DateTime      @updatedAt @db.Timestamptz
+  deletedAt   DateTime?     @db.Timestamptz
+}
+
+model AccessGrant {
+  id                String    @id @default(cuid())
+  personId          String
+  person            Person    @relation(fields: [personId], references: [id])
+  systemId          String
+  system            SystemApp @relation(fields: [systemId], references: [id])
+  accountIdentifier String // username or email on that system
+  accessLevel       String // "Member", "Admin", "Read-only"...
+  grantedOn         DateTime  @db.Date
+  grantedById       String? // User
+  revokedOn         DateTime? @db.Date
+  revokedById       String?
+  notes             String?
+  createdAt         DateTime  @default(now()) @db.Timestamptz
+  updatedAt         DateTime  @updatedAt @db.Timestamptz
+  deletedAt         DateTime? @db.Timestamptz
+
+  @@index([personId, revokedOn])
+}
+
+enum AssetType {
+  LAPTOP
+  MONITOR
+  ID_CARD
+  PHONE
+  ACCESSORY
+  OTHER
+}
+
+enum AssetStatus {
+  IN_STOCK
+  ASSIGNED
+  IN_REPAIR
+  RETIRED
+  LOST
+}
+
+enum AssetCondition {
+  NEW
+  GOOD
+  FAIR
+  DAMAGED
+}
+
+model Asset {
+  id            String            @id @default(cuid())
+  assetTag      String            @unique // MD-AST-0001
+  type          AssetType
+  make          String?
+  model         String?
+  serialNumber  String?           @unique
+  purchaseDate  DateTime?         @db.Date
+  condition     AssetCondition    @default(GOOD)
+  status        AssetStatus       @default(IN_STOCK)
+  notes         String?
+  assignments   AssetAssignment[]
+  createdAt     DateTime          @default(now()) @db.Timestamptz
+  updatedAt     DateTime          @updatedAt @db.Timestamptz
+  deletedAt     DateTime?         @db.Timestamptz
+}
+
+model AssetAssignment {
+  id                String          @id @default(cuid())
+  assetId           String
+  asset             Asset           @relation(fields: [assetId], references: [id])
+  personId          String
+  person            Person          @relation(fields: [personId], references: [id])
+  assignedOn        DateTime        @db.Date
+  conditionAtIssue  AssetCondition
+  returnedOn        DateTime?       @db.Date // null = still with the person
+  conditionOnReturn AssetCondition?
+  notes             String?
+  createdAt         DateTime        @default(now()) @db.Timestamptz
+  updatedAt         DateTime        @updatedAt @db.Timestamptz
+  deletedAt         DateTime?       @db.Timestamptz
+
+  @@index([personId, returnedOn])
+  @@index([assetId, returnedOn])
+}
+
+// ───────────────────────────────────── Attendance ─────────────────────────────────────
+
+enum WorkMode {
+  OFFICE
+  WFH
+  CLIENT_SITE
+}
+
+enum AttendanceSource {
+  WEB
+  REGULARISATION
+  HR_EDIT
+}
+
+model AttendanceRecord {
+  id         String           @id @default(cuid())
+  personId   String
+  person     Person           @relation(fields: [personId], references: [id])
+  date       DateTime         @db.Date // IST calendar day
+  checkInAt  DateTime?        @db.Timestamptz
+  checkOutAt DateTime?        @db.Timestamptz
+  workMode   WorkMode
+  source     AttendanceSource @default(WEB)
+  createdAt  DateTime         @default(now()) @db.Timestamptz
+  updatedAt  DateTime         @updatedAt @db.Timestamptz
+  deletedAt  DateTime?        @db.Timestamptz
+
+  @@unique([personId, date])
+  @@index([date])
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model Regularisation {
+  id          String         @id @default(cuid())
+  personId    String
+  person      Person         @relation(fields: [personId], references: [id])
+  date        DateTime       @db.Date
+  checkInAt   DateTime       @db.Timestamptz
+  checkOutAt  DateTime?      @db.Timestamptz
+  workMode    WorkMode
+  reason      String
+  status      ApprovalStatus @default(PENDING)
+  approverId  String? // User who decided
+  decidedAt   DateTime?      @db.Timestamptz
+  decisionNote String?
+  createdAt   DateTime       @default(now()) @db.Timestamptz
+  updatedAt   DateTime       @updatedAt @db.Timestamptz
+  deletedAt   DateTime?      @db.Timestamptz
+
+  @@index([status, date])
+}
+
+model Holiday {
+  id         String    @id @default(cuid())
+  date       DateTime  @db.Date
+  name       String
+  isOptional Boolean   @default(false) // restricted holiday
+  createdAt  DateTime  @default(now()) @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @db.Timestamptz
+  deletedAt  DateTime? @db.Timestamptz
+
+  @@unique([date, name])
+}
+
+// ─────────────────────────────────────── Leave ───────────────────────────────────────
+
+enum AccrualMode {
+  UPFRONT_YEARLY // full quota on leave-year start (or pro-rated on joining)
+  MONTHLY // quota / 12 credited on the 1st of each month
+  NONE // e.g. comp-off (credited manually), LOP
+}
+
+model LeaveType {
+  id          String         @id @default(cuid())
+  code        String         @unique // CL, SL, EL, CO, LOP
+  name        String
+  isPaid      Boolean        @default(true)
+  allowHalfDay Boolean       @default(true)
+  colour      String?
+  policies    LeavePolicy[]
+  requests    LeaveRequest[]
+  ledger      LeaveLedgerEntry[]
+  createdAt   DateTime       @default(now()) @db.Timestamptz
+  updatedAt   DateTime       @updatedAt @db.Timestamptz
+  deletedAt   DateTime?      @db.Timestamptz
+}
+
+// How much of a leave type an employment type gets.
+model LeavePolicy {
+  id                  String         @id @default(cuid())
+  leaveTypeId         String
+  leaveType           LeaveType      @relation(fields: [leaveTypeId], references: [id])
+  employmentType      EmploymentType
+  annualQuotaUnits    Int // half-day units
+  accrual             AccrualMode
+  carryForwardMaxUnits Int           @default(0)
+  allowNegative       Boolean        @default(false)
+  createdAt           DateTime       @default(now()) @db.Timestamptz
+  updatedAt           DateTime       @updatedAt @db.Timestamptz
+  deletedAt           DateTime?      @db.Timestamptz
+
+  @@unique([leaveTypeId, employmentType])
+}
+
+enum LedgerKind {
+  ACCRUAL
+  CARRY_FORWARD
+  LAPSE
+  COMP_OFF_CREDIT
+  TAKEN
+  REVERSAL // cancelled approved leave
+  ADJUSTMENT
+}
+
+// Balance = SUM(units) per person/type/leaveYear. Append-only.
+model LeaveLedgerEntry {
+  id             String        @id @default(cuid())
+  personId       String
+  person         Person        @relation(fields: [personId], references: [id])
+  leaveTypeId    String
+  leaveType      LeaveType     @relation(fields: [leaveTypeId], references: [id])
+  leaveYear      Int
+  kind           LedgerKind
+  units          Int // signed half-day units
+  leaveRequestId String?
+  leaveRequest   LeaveRequest? @relation(fields: [leaveRequestId], references: [id])
+  note           String?
+  createdById    String?
+  createdAt      DateTime      @default(now()) @db.Timestamptz
+  updatedAt      DateTime      @updatedAt @db.Timestamptz
+  deletedAt      DateTime?     @db.Timestamptz
+
+  @@index([personId, leaveTypeId, leaveYear])
+}
+
+enum DayHalf {
+  FULL
+  FIRST_HALF
+  SECOND_HALF
+}
+
+model LeaveRequest {
+  id           String             @id @default(cuid())
+  personId     String
+  person       Person             @relation(fields: [personId], references: [id])
+  leaveTypeId  String
+  leaveType    LeaveType          @relation(fields: [leaveTypeId], references: [id])
+  startDate    DateTime           @db.Date
+  startHalf    DayHalf            @default(FULL)
+  endDate      DateTime           @db.Date
+  endHalf      DayHalf            @default(FULL)
+  units        Int // working half-days, excluding weekly offs and holidays
+  reason       String?
+  status       ApprovalStatus     @default(PENDING)
+  approverId   String?
+  decidedAt    DateTime?          @db.Timestamptz
+  decisionNote String?
+  ledger       LeaveLedgerEntry[]
+  createdAt    DateTime           @default(now()) @db.Timestamptz
+  updatedAt    DateTime           @updatedAt @db.Timestamptz
+  deletedAt    DateTime?          @db.Timestamptz
+
+  @@index([personId, startDate])
+  @@index([status])
+}
+
+// ────────────────────────────────────── Payroll ──────────────────────────────────────
+
+enum ComponentKind {
+  EARNING
+  DEDUCTION
+  EMPLOYER_CONTRIBUTION // shown on CTC, not in gross
+}
+
+enum ComponentCalc {
+  FIXED // amount set per employee in the structure
+  STATUTORY_PF_EMPLOYEE
+  STATUTORY_PF_EMPLOYER
+  STATUTORY_ESI_EMPLOYEE
+  STATUTORY_ESI_EMPLOYER
+  STATUTORY_PT
+  MANUAL_TDS // entered per run
+}
+
+model SalaryComponent {
+  id          String        @id @default(cuid())
+  code        String        @unique // BASIC, HRA, SPECIAL, STIPEND, PF_EE, PF_ER, ESI_EE, ESI_ER, PT, TDS
+  name        String
+  kind        ComponentKind
+  calc        ComponentCalc @default(FIXED)
+  proratesWithLop Boolean   @default(true)
+  isPfWage    Boolean       @default(false) // counts towards PF wages
+  isEsiWage   Boolean       @default(false)
+  sortOrder   Int
+  lines       SalaryStructureLine[]
+  createdAt   DateTime      @default(now()) @db.Timestamptz
+  updatedAt   DateTime      @updatedAt @db.Timestamptz
+  deletedAt   DateTime?     @db.Timestamptz
+}
+
+model SalaryStructure {
+  id            String                @id @default(cuid())
+  employmentId  String
+  employment    Employment            @relation(fields: [employmentId], references: [id])
+  effectiveFrom DateTime              @db.Date
+  effectiveTo   DateTime?             @db.Date
+  pfApplicable  Boolean               @default(true) // false for interns
+  esiApplicable Boolean               @default(false)
+  lines         SalaryStructureLine[]
+  createdAt     DateTime              @default(now()) @db.Timestamptz
+  updatedAt     DateTime              @updatedAt @db.Timestamptz
+  deletedAt     DateTime?             @db.Timestamptz
+
+  @@index([employmentId, effectiveFrom])
+}
+
+model SalaryStructureLine {
+  id               String          @id @default(cuid())
+  structureId      String
+  structure        SalaryStructure @relation(fields: [structureId], references: [id])
+  componentId      String
+  component        SalaryComponent @relation(fields: [componentId], references: [id])
+  monthlyAmountPaise Int
+  createdAt        DateTime        @default(now()) @db.Timestamptz
+  updatedAt        DateTime        @updatedAt @db.Timestamptz
+  deletedAt        DateTime?       @db.Timestamptz
+
+  @@unique([structureId, componentId])
+}
+
+enum PayrollRunStatus {
+  DRAFT // HR computing / editing
+  IN_REVIEW // HR marked ready
+  LOCKED // Admin locked; immutable
+}
+
+model PayrollRun {
+  id         String           @id @default(cuid())
+  year       Int
+  month      Int // 1-12
+  status     PayrollRunStatus @default(DRAFT)
+  computedAt DateTime?        @db.Timestamptz
+  lockedAt   DateTime?        @db.Timestamptz
+  lockedById String?
+  statutorySnapshot Json? // copy of PF/ESI/PT settings used, frozen at lock
+  entries    PayrollEntry[]
+  createdAt  DateTime         @default(now()) @db.Timestamptz
+  updatedAt  DateTime         @updatedAt @db.Timestamptz
+  deletedAt  DateTime?        @db.Timestamptz
+
+  @@unique([year, month])
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  ON_HOLD
+}
+
+model PayrollEntry {
+  id               String        @id @default(cuid())
+  runId            String
+  run              PayrollRun    @relation(fields: [runId], references: [id])
+  employmentId     String
+  employment       Employment    @relation(fields: [employmentId], references: [id])
+  daysInMonth      Int
+  payableDaysUnits Int // half-day units
+  lopDaysUnits     Int
+  presentDaysUnits Int
+  grossPaise       Int
+  deductionsPaise  Int
+  netPaise         Int
+  tdsPaise         Int           @default(0) // manual
+  paymentStatus    PaymentStatus @default(PENDING)
+  paidOn           DateTime?     @db.Date
+  transactionRef   String?
+  bankSnapshot     Json? // masked account + encrypted refs used for export
+  lines            PayrollEntryLine[]
+  reimbursements   Reimbursement[]
+  adjustments      PayrollAdjustment[] @relation("AppliedIn")
+  payslipFileId    String?       @unique
+  payslipFile      StoredFile?   @relation("Payslip", fields: [payslipFileId], references: [id])
+  createdAt        DateTime      @default(now()) @db.Timestamptz
+  updatedAt        DateTime      @updatedAt @db.Timestamptz
+  deletedAt        DateTime?     @db.Timestamptz
+
+  @@unique([runId, employmentId])
+}
+
+model PayrollEntryLine {
+  id          String        @id @default(cuid())
+  entryId     String
+  entry       PayrollEntry  @relation(fields: [entryId], references: [id])
+  code        String // snapshot of component code/name so later setting changes don't alter history
+  name        String
+  kind        ComponentKind
+  amountPaise Int
+  sortOrder   Int
+  createdAt   DateTime      @default(now()) @db.Timestamptz
+  updatedAt   DateTime      @updatedAt @db.Timestamptz
+  deletedAt   DateTime?     @db.Timestamptz
+}
+
+// Corrections to locked months, and one-off earnings/deductions.
+model PayrollAdjustment {
+  id             String        @id @default(cuid())
+  personId       String
+  person         Person        @relation(fields: [personId], references: [id])
+  kind           ComponentKind // EARNING or DEDUCTION
+  amountPaise    Int
+  reason         String
+  relatesToYear  Int? // the locked month being corrected
+  relatesToMonth Int?
+  appliedInEntryId String?
+  appliedInEntry PayrollEntry? @relation("AppliedIn", fields: [appliedInEntryId], references: [id])
+  createdById    String
+  createdAt      DateTime      @default(now()) @db.Timestamptz
+  updatedAt      DateTime      @updatedAt @db.Timestamptz
+  deletedAt      DateTime?     @db.Timestamptz
+}
+
+enum ReimbursementStatus {
+  SUBMITTED
+  MANAGER_APPROVED
+  APPROVED // HR approved; eligible for next payroll run
+  REJECTED
+  PAID // included in a locked run
+  CANCELLED
+}
+
+model Reimbursement {
+  id             String              @id @default(cuid())
+  personId       String
+  person         Person              @relation(fields: [personId], references: [id])
+  category       String // Travel, Internet, Meals, Equipment...
+  expenseDate    DateTime            @db.Date
+  amountPaise    Int
+  description    String
+  receiptFileId  String              @unique
+  receiptFile    StoredFile          @relation("Receipt", fields: [receiptFileId], references: [id])
+  status         ReimbursementStatus @default(SUBMITTED)
+  managerDecidedById String?
+  managerDecidedAt   DateTime?       @db.Timestamptz
+  hrDecidedById  String?
+  hrDecidedAt    DateTime?           @db.Timestamptz
+  decisionNote   String?
+  payrollEntryId String?
+  payrollEntry   PayrollEntry?       @relation(fields: [payrollEntryId], references: [id])
+  createdAt      DateTime            @default(now()) @db.Timestamptz
+  updatedAt      DateTime            @updatedAt @db.Timestamptz
+  deletedAt      DateTime?           @db.Timestamptz
+
+  @@index([status])
+}
+
+// Column mapping for the bank portal upload, e.g.
+// [{ "header": "Beneficiary A/c", "field": "accountNumber" }, { "header": "Amount", "field": "netRupees" }]
+model BankExportFormat {
+  id         String   @id @default(cuid())
+  name       String   @unique
+  delimiter  String   @default(",")
+  hasHeader  Boolean  @default(true)
+  columns    Json
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now()) @db.Timestamptz
+  updatedAt  DateTime @updatedAt @db.Timestamptz
+  deletedAt  DateTime? @db.Timestamptz
+}
+
+// ───────────────────────────────────── Documents ─────────────────────────────────────
+
+// Metadata for anything in the storage backend (local disk / S3). Served only via
+// authenticated route handlers that re-check permissions.
+model StoredFile {
+  id           String    @id @default(cuid())
+  storageKey   String    @unique // opaque, never shown in URLs
+  originalName String
+  mimeType     String
+  sizeBytes    Int
+  sha256       String
+  uploadedById String?
+  personPhoto       Person?            @relation("PersonPhoto")
+  payslip           PayrollEntry?      @relation("Payslip")
+  receipt           Reimbursement?     @relation("Receipt")
+  personDocument    PersonDocument?
+  generatedDocument GeneratedDocument?
+  createdAt    DateTime  @default(now()) @db.Timestamptz
+  updatedAt    DateTime  @updatedAt @db.Timestamptz
+  deletedAt    DateTime? @db.Timestamptz
+}
+
+enum DocumentCategory {
+  OFFER_LETTER
+  ID_PROOF
+  EDUCATION
+  NDA
+  RELIEVING_LETTER
+  EXPERIENCE_LETTER
+  INTERNSHIP_LETTER
+  INTERNSHIP_CERTIFICATE
+  SALARY_CERTIFICATE
+  OTHER
+}
+
+model PersonDocument {
+  id         String           @id @default(cuid())
+  personId   String
+  person     Person           @relation(fields: [personId], references: [id])
+  category   DocumentCategory
+  title      String
+  fileId     String           @unique
+  file       StoredFile       @relation(fields: [fileId], references: [id])
+  visibleToEmployee Boolean   @default(true)
+  verifiedById String?
+  verifiedAt DateTime?        @db.Timestamptz
+  createdAt  DateTime         @default(now()) @db.Timestamptz
+  updatedAt  DateTime         @updatedAt @db.Timestamptz
+  deletedAt  DateTime?        @db.Timestamptz
+
+  @@index([personId, category])
+}
+
+enum TemplateKind {
+  OFFER_LETTER
+  INTERNSHIP_LETTER
+  INTERNSHIP_COMPLETION
+  EXPERIENCE_LETTER
+  SALARY_CERTIFICATE
+}
+
+// Body is Markdown with {{placeholders}}, rendered into a fixed letterhead layout.
+// Editing creates a new version; generated documents keep a pointer to the version used.
+model DocumentTemplate {
+  id        String              @id @default(cuid())
+  kind      TemplateKind
+  version   Int
+  title     String
+  body      String
+  isActive  Boolean             @default(true)
+  generated GeneratedDocument[]
+  createdAt DateTime            @default(now()) @db.Timestamptz
+  updatedAt DateTime            @updatedAt @db.Timestamptz
+  deletedAt DateTime?           @db.Timestamptz
+
+  @@unique([kind, version])
+}
+
+model GeneratedDocument {
+  id         String           @id @default(cuid())
+  personId   String
+  person     Person           @relation(fields: [personId], references: [id])
+  templateId String
+  template   DocumentTemplate @relation(fields: [templateId], references: [id])
+  fileId     String           @unique
+  file       StoredFile       @relation(fields: [fileId], references: [id])
+  data       Json // values merged into the placeholders
+  issuedById String
+  issuedAt   DateTime         @default(now()) @db.Timestamptz
+  createdAt  DateTime         @default(now()) @db.Timestamptz
+  updatedAt  DateTime         @updatedAt @db.Timestamptz
+  deletedAt  DateTime?        @db.Timestamptz
+}
+
+// ───────────────────────────────── Settings & audit ─────────────────────────────────
+
+// Singleton row (id = "company").
+model CompanySettings {
+  id                   String   @id @default("company")
+  legalName            String
+  displayName          String
+  addressLines         String // multiline
+  logoFileId           String?
+  pfRegistrationNo     String?
+  esiRegistrationNo    String?
+  ptRegistrationNo     String?
+  weeklyOffs           Json // e.g. { "SUN": "ALL", "SAT": [2, 4] }
+  halfDayMinMinutes    Int // below this worked time = half day
+  fullDayMinMinutes    Int
+  leaveYearStartMonth  Int     @default(1) // 1 = Jan, 4 = Apr
+  passwordManagerUrl   String?
+  itOwnerPersonId      String? // receives IT checklist tasks
+  internEndLeadDays    Int     @default(14)
+  // Statutory values — intentionally NULL until HR enters them after checking with the CA.
+  // Payroll runs are blocked while any required value is missing.
+  statutory            Json?   // { pfEmployeeRateBp, pfEmployerRateBp, pfWageCeilingPaise, esiEmployeeRateBp, esiEmployerRateBp, esiGrossCeilingPaise, ptSlabs: [{ fromPaise, toPaise, amountPaise, monthOverrides? }], verifiedBy, verifiedOn }
+  updatedAt            DateTime @updatedAt @db.Timestamptz
+  createdAt            DateTime @default(now()) @db.Timestamptz
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE // soft delete
+  RESTORE
+  LOCK
+  EXPORT
+  VIEW_SENSITIVE // unmasking statutory/bank data
+}
+
+// Append-only; no updatedAt/deletedAt by design (the one exception to the table convention).
+model AuditLog {
+  id         String      @id @default(cuid())
+  actorId    String?
+  actor      User?       @relation(fields: [actorId], references: [id])
+  action     AuditAction
+  entityType String // "Person", "PayrollEntry", "AccessGrant", ...
+  entityId   String
+  before     Json? // encrypted fields recorded as "«changed»", never plaintext
+  after      Json?
+  requestId  String?
+  createdAt  DateTime    @default(now()) @db.Timestamptz
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+}
